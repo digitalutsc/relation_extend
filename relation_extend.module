@@ -1,0 +1,88 @@
+<?php
+
+use Drupal\Core\Entity\EntityInterface;
+
+/**
+ * Implements hook_jsonld_alter_normalized_array().
+ *
+ * Expands dcterms:relation entries by discovering any relationship nodes,
+ * reading their roles and target entities, and injecting corresponding RDF
+ * predicates into the JSON-LD graph in an extensible way.
+ */
+function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, array &$normalized, array $context) {
+  // Only act on node entities.
+  if ($entity->getEntityTypeId() !== 'node') {
+    return;
+  }
+
+  // Locate this entity's graph item.
+  $current_url = $entity->toUrl('canonical', ['absolute' => TRUE])->toString();
+  $graph_index = NULL;
+  foreach ($normalized['@graph'] as $index => $item) {
+    if (!empty($item['@id']) && $item['@id'] === $current_url) {
+      $graph_index = $index;
+      break;
+    }
+  }
+  if ($graph_index === NULL) {
+    return;
+  }
+
+  // Reference the specific graph item for modifications.
+  $graph_item = &$normalized['@graph'][$graph_index];
+
+  if (empty($graph_item['dcterms:relation'])) {
+    return;
+  }
+
+  // Loop each relation entry.
+  foreach ($graph_item['dcterms:relation'] as $rel_idx => $rel_item) {
+    $rel_url = $rel_item['@id'] ?? '';
+    if (!preg_match('@/node/(\d+)$@', (string) $rel_url, $matches)) {
+      continue;
+    }
+    $rel_nid = $matches[1];
+    $rel_node = \Drupal::entityTypeManager()->getStorage('node')->load($rel_nid);
+    if (!$rel_node) {
+      continue;
+    }
+
+    if (!$rel_node->hasField('field_role') || $rel_node->get('field_role')->isEmpty()) {
+      continue;
+    }
+    $roles = $rel_node->get('field_role')->referencedEntities();
+
+    // Discover all 'to' entity-reference fields (field_to_*).
+    foreach ($rel_node->getFieldDefinitions() as $field_name => $definition) {
+      if ($definition->getType() !== 'entity_reference' || strpos($field_name, 'field_to_') !== 0) {
+        continue;
+      }
+      $field = $rel_node->get($field_name);
+      if ($field->isEmpty()) {
+        continue;
+      }
+
+      $targets = $field->referencedEntities();
+      foreach ($targets as $target_entity) {
+        $to_url = $target_entity->toUrl('canonical', ['absolute' => TRUE])->toString();
+
+        // Inject a triple for each role's RDF property.
+        foreach ($roles as $role_term) {
+          if (!$role_term->hasField('field_rdf_property') || $role_term->get('field_rdf_property')->isEmpty()) {
+            continue;
+          }
+          $rdf_property = $role_term->get('field_rdf_property')->value;
+          $graph_item[$rdf_property][] = ['@id' => $to_url];
+        }
+      }
+    }
+
+    // Remove the raw relation entry.
+    unset($graph_item['dcterms:relation'][$rel_idx]);
+  }
+
+  // If no relations remain, drop the property.
+  if (empty($graph_item['dcterms:relation'])) {
+    unset($graph_item['dcterms:relation']);
+  }
+}
