@@ -1,0 +1,6 @@
+{
+  "name": "islandora_lite/relation_extend",
+  "type": "drupal-module",
+  "description": "This module will flattout the relationship for json_ld module for relationship entities in Dragomans site ",
+  "keywords": ["Drupal"]
+}
