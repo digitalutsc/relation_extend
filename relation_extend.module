@@ -2,6 +2,13 @@
 
 use Drupal\Core\Entity\EntityInterface;
 
+use Drupal\Core\Path\AliasManagerInterface;
+use Drupal\node\Entity\Node;
+use Symfony\Component\DependencyInjection\ContainerInterface;
+use Drupal\Core\Link;
+use Drupal\Core\Url;
+use Symfony\Component\HttpFoundation\Request;
+
 /**
  * Implements hook_jsonld_alter_normalized_array().
  *
@@ -10,18 +17,44 @@ use Drupal\Core\Entity\EntityInterface;
  * predicates into the JSON-LD graph in an extensible way.
  */
 function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, array &$normalized, array $context) {
+  
+  // Get the current request.
+  $request = \Drupal::request();
+
+  // Get the base URL.
+  $based_url = $request->getSchemeAndHttpHost();
+
   // Only act on node entities.
-  if ($entity->getEntityTypeId() !== 'node') {
+  if (!in_array($entity->getEntityTypeId(), ['node', 'taxonomy_term'])) {
     return;
   }
 
   // Locate this entity's graph item.
   $current_url = $entity->toUrl('canonical', ['absolute' => TRUE])->toString();
+  if ($entity->getEntityTypeId() == 'node') {
+    $current_node_url = $based_url . "/node/" . $entity->id();
+  } elseif ($entity->getEntityTypeId() == 'taxonomy_term') {
+    $current_node_url = $based_url . "/taxonomy/term/" . $entity->id();
+  }
+
   $graph_index = NULL;
   foreach ($normalized['@graph'] as $index => $item) {
-    if (!empty($item['@id']) && $item['@id'] === $current_url) {
-      $graph_index = $index;
-      break;
+    if (!empty($item['@id'])) {  
+      // Remove the substring
+      $current_node = str_replace("?_format=jsonld", "", $item['@id']);
+
+      $current_node = str_replace($based_url, "", $current_node);
+
+      // Get the alias manager service.
+      $alias_manager = \Drupal::service('path_alias.manager');
+
+      // Look up the alias for the canonical path.
+      $alias = $based_url . $alias_manager->getAliasByPath($current_node);
+
+      if ($alias == $current_url) {
+        $graph_index = $index;
+        break;
+      }
     }
   }
   if ($graph_index === NULL) {
@@ -31,17 +64,31 @@ function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, 
   // Reference the specific graph item for modifications.
   $graph_item = &$normalized['@graph'][$graph_index];
 
-  if (empty($graph_item['dcterms:relation'])) {
+  // Loop each relation entry.
+  $relation_id = "http://purl.org/dc/terms/relation";
+  //$relation_id = 'dcterms:relation';
+
+  if (empty($graph_item[$relation_id])) {
     return;
   }
 
   // Loop each relation entry.
-  foreach ($graph_item['dcterms:relation'] as $rel_idx => $rel_item) {
+  $relation_id = "http://purl.org/dc/terms/relation";
+  //$relation_id = 'dcterms:relation';
+
+  foreach ($graph_item[$relation_id] as $rel_idx => $rel_item) {
     $rel_url = $rel_item['@id'] ?? '';
+
+    if (strpos($rel_url, "?_format=jsonld") !== false) {
+       $rel_url = str_replace("?_format=jsonld", "", $rel_url);
+    }
+      
     if (!preg_match('@/node/(\d+)$@', (string) $rel_url, $matches)) {
       continue;
     }
+
     $rel_nid = $matches[1];
+    
     $rel_node = \Drupal::entityTypeManager()->getStorage('node')->load($rel_nid);
     if (!$rel_node) {
       continue;
@@ -50,39 +97,67 @@ function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, 
     if (!$rel_node->hasField('field_role') || $rel_node->get('field_role')->isEmpty()) {
       continue;
     }
+
     $roles = $rel_node->get('field_role')->referencedEntities();
 
+    $inference_rels = [
+        "http://www.wikidata.org/entity/Q7566", // parent 
+        "http://www.wikidata.org/entity/Q29514218" // child
+    ];
+
+    $thisisinference = false;
+    if (in_array($roles[0]->get('field_external_uri')->title, $inference_rels)) {
+        $thisisinference = true;
+    }
+    $fromTo = true;
     // Discover all 'to' entity-reference fields (field_to_*).
     foreach ($rel_node->getFieldDefinitions() as $field_name => $definition) {
-      if ($definition->getType() !== 'entity_reference' || strpos($field_name, 'field_to_') !== 0) {
-        continue;
-      }
-      $field = $rel_node->get($field_name);
-      if ($field->isEmpty()) {
-        continue;
-      }
+      if ($definition->getType() === 'entity_reference' && !in_array($field_name, ['type', 'field_relationship_type', 'menu_link', 'uid', 'revision_uid', 'field_role']) ) {
+          if ( strpos($field_name, "_from_") !== false) {
+            // only proceed if the field_from point to the current node
+            if ($entity->id() != $rel_node->get($field_name)->referencedEntities()[0]->id()) {
+               $fromTo = false;
+               break;
+            }
+          }         
+          $field = $rel_node->get($field_name);
+          if (!$field->isEmpty()) {
+              $targets = $field->referencedEntities();
+              foreach ($targets as $target_entity) {
+                //$to_url = $target_entity->toUrl('canonical', ['absolute' => TRUE])->toString();
+                if ($target_entity->getEntityTypeId() == 'node') {
+                   $to_url = $based_url . "/node/" . $target_entity->id();
+                } elseif ($target_entity->getEntityTypeId() == 'taxonomy_term') {
+                    $to_url = $based_url . "/taxonomy/term/" . $target_entity->id();
+                }
+                if ($current_node_url !== $to_url) {
+                    $to_url .= "?_format=jsonld";
+                    
+                    // Inject a triple for each role's RDF property.
+                    foreach ($roles as $role_term) {
+                      if ($role_term->hasField('field_external_uri') &&  !$role_term->get('field_external_uri')->isEmpty()) {
+                        $url = $role_term->get('field_external_uri')->uri;
+                        $link = Link::fromTextAndUrl($role_term->get('field_external_uri')->title, Url::fromUri($url));
+                        $rdf_mapping = $link->getUrl()->toUriString();
+                      }
+                      else {
+                        $rdf_mapping = $based_url . $role_term->toUrl()->toString();
+                      }
 
-      $targets = $field->referencedEntities();
-      foreach ($targets as $target_entity) {
-        $to_url = $target_entity->toUrl('canonical', ['absolute' => TRUE])->toString();
-
-        // Inject a triple for each role's RDF property.
-        foreach ($roles as $role_term) {
-          if (!$role_term->hasField('field_rdf_property') || $role_term->get('field_rdf_property')->isEmpty()) {
-            continue;
-          }
-          $rdf_property = $role_term->get('field_rdf_property')->value;
-          $graph_item[$rdf_property][] = ['@id' => $to_url];
-        }
-      }
+                      $graph_item[$rdf_mapping][] = ['@id' => $to_url];
+                    }
+                }
+              }
+           }
+       }
     }
 
     // Remove the raw relation entry.
-    unset($graph_item['dcterms:relation'][$rel_idx]);
+    unset($graph_item[$relation_id][$rel_idx]);
   }
 
   // If no relations remain, drop the property.
   if (empty($graph_item['dcterms:relation'])) {
-    unset($graph_item['dcterms:relation']);
+    unset($graph_item[$relation_id]);
   }
 }
