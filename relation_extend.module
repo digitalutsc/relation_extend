@@ -100,20 +100,6 @@ function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, 
 
     $roles = $rel_node->get('field_role')->referencedEntities();
 
-    $inference_rels = [
-    // Parent.
-      "http://www.wikidata.org/entity/Q7566",
-    // Child.
-      "http://www.wikidata.org/entity/Q29514218",
-    ];
-
-    // phpcs:disable
-    $thisisinference = FALSE;
-    if (in_array($roles[0]->get('field_external_uri')->title, $inference_rels)) {
-      $thisisinference = TRUE;
-    }
-    $fromTo = TRUE;
-    // phpcs:enable
     // Discover all 'to' entity-reference fields (field_to_*).
     foreach ($rel_node->getFieldDefinitions() as $field_name => $definition) {
       if (
@@ -133,8 +119,6 @@ function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, 
         if (strpos($field_name, "_from_") !== FALSE) {
           // Only proceed if the field_from point to the current node.
           if ($entity->id() != $rel_node->get($field_name)->referencedEntities()[0]->id()) {
-            // phpcs:ignore -- Unused variable $fromTo.
-            $fromTo = FALSE;
             break;
           }
         }
@@ -142,8 +126,8 @@ function relation_extend_jsonld_alter_normalized_array(EntityInterface $entity, 
         if (!$field->isEmpty()) {
           $targets = $field->referencedEntities();
           foreach ($targets as $target_entity) {
-            // phpcs:ignore -- Line exceeds 80 characters; contains 94 characters
-            // $to_url = $target_entity->toUrl('canonical', ['absolute' => TRUE])->toString();
+            // $to_url = $target_entity->toUrl('canonical',
+            // ['absolute' => TRUE])->toString();
             if ($target_entity->getEntityTypeId() == 'node') {
               $to_url = $based_url . "/node/" . $target_entity->id();
             }
